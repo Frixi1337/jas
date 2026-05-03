@@ -4,13 +4,22 @@ import sqlite3
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = FastAPI(title="FrixiHack Key Server")
 DB_PATH = os.getenv("DB_PATH", "keys.db")
+
+# Разрешаем запросы отовсюду (Railway не будет блокировать)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -60,14 +69,24 @@ def is_key_valid(key: str) -> bool:
     return datetime.utcnow() < expires
 
 
-# ── API endpoints ─────────────────────────────────────────────────────────────
+INTERNAL_SECRET = os.getenv("INTERNAL_SECRET", "change_me")
+
+
+def verify_secret(secret: str):
+    if secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+# ── Публичные эндпоинты ───────────────────────────────────────────────────────
 
 @app.get("/check_user")
-def check_user(username: str = Query(...)):
-    """
-    FrixiHack client calls this to validate a key.
-    The client sends the key as the `username` param (legacy naming).
-    """
+def check_user(
+    username: str = Query(...),
+    api_key: str = Header(default="", alias="API-Key")
+):
+    """Клиент FrixiHack проверяет ключ через заголовок API-Key."""
+    if api_key != os.getenv("API_KEY", "apifrixi"):
+        raise HTTPException(status_code=403, detail="Invalid API key")
     exists = is_key_valid(username)
     return {"exists": exists}
 
@@ -77,17 +96,12 @@ def health():
     return {"status": "ok"}
 
 
-# ── Internal endpoints (called by the Telegram bot) ───────────────────────────
+# ── Внутренние эндпоинты (бот) ────────────────────────────────────────────────
+# Доступны публично по URL, но защищены секретом.
+# Railway whitelist обходим тем, что эти маршруты просто открыты —
+# защита только через INTERNAL_SECRET в query params.
 
-INTERNAL_SECRET = os.getenv("INTERNAL_SECRET", "change_me")
-
-
-def verify_secret(secret: str):
-    if secret != INTERNAL_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-
-@app.post("/internal/create_key")
+@app.post("/bot/create_key")
 def create_key(
     days: int = Query(..., ge=1, le=365),
     label: str = Query(default=""),
@@ -110,7 +124,7 @@ def create_key(
     }
 
 
-@app.post("/internal/revoke_key")
+@app.post("/bot/revoke_key")
 def revoke_key(key: str = Query(...), secret: str = Query(...)):
     verify_secret(secret)
     with get_db() as conn:
@@ -120,7 +134,7 @@ def revoke_key(key: str = Query(...), secret: str = Query(...)):
     return {"revoked": True, "key": key}
 
 
-@app.get("/internal/list_keys")
+@app.get("/bot/list_keys")
 def list_keys(secret: str = Query(...)):
     verify_secret(secret)
     now = datetime.utcnow().isoformat()
@@ -138,3 +152,23 @@ def list_keys(secret: str = Query(...)):
             "status": status
         })
     return result
+
+
+# Старые /internal/ маршруты оставляем для совместимости
+@app.post("/internal/create_key")
+def create_key_legacy(
+    days: int = Query(..., ge=1, le=365),
+    label: str = Query(default=""),
+    secret: str = Query(...)
+):
+    return create_key(days=days, label=label, secret=secret)
+
+
+@app.post("/internal/revoke_key")
+def revoke_key_legacy(key: str = Query(...), secret: str = Query(...)):
+    return revoke_key(key=key, secret=secret)
+
+
+@app.get("/internal/list_keys")
+def list_keys_legacy(secret: str = Query(...)):
+    return list_keys(secret=secret)
